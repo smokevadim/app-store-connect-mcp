@@ -276,9 +276,18 @@ The App Store Server API answers questions about individual customers rather tha
 | `ASC_INCLUDE_DEPRECATED` | no | `true` to also load deprecated operations |
 | `ASC_RATE_LIMIT_PER_HOUR` | no | Lower the hourly pacing budget below Apple's 3,600. Each process paces itself as if it were the only client of the key, so several agents sharing one team key will together burn the quota — give each a slice |
 | `ASC_RATE_LIMIT_PER_MINUTE` | no | Same for the per-minute window (default 300) |
+| `ASC_JWT_LIFETIME_SECONDS` | no | Lifetime for new App Store Connect JWTs. Must be an integer from 300 through 1,199 (default 1,080); values at Apple's 1,200-second boundary are rejected |
+| `ASC_AUTH_RETRY_DELAY_MS` | no | Delay before the one read-only 401 recovery attempt. Must be an integer from 0 through 60,000 milliseconds (default 8,000) |
 | `ASC_CONFIG_DIR` | no | Override the shared-config directory (default `~/.config/asc-mcp`) |
 
 \* Supply the private key exactly one way. If more than one is set, precedence is `ASC_PRIVATE_KEY` (inline) → `ASC_PRIVATE_KEY_KEYCHAIN` → `ASC_PRIVATE_KEY_PATH`. Env credentials override the shared config file entirely, so you can't accidentally mix two accounts.
+
+**Authentication recovery.** A GET or HEAD that receives a 401 waits for
+`ASC_AUTH_RETRY_DELAY_MS`, refreshes the cached JWT, and retries exactly once.
+POST, PATCH, and DELETE requests never retry a 401. If the retry also returns
+401, Heimdall keeps Apple's status, issues, and request ID in the error; treat
+it as an authentication or authorization problem and investigate the key,
+role, agreement, or account state rather than assuming the request succeeded.
 
 **Choosing how to supply the key** — all three produce the same result; pick by how private you need the key to be.
 
@@ -706,9 +715,18 @@ App Store Server API, listeniz hakkında değil tek tek müşteriler hakkında s
 | `ASC_INCLUDE_DEPRECATED` | hayır | Kullanımdan kaldırılmış işlemleri de yüklemek için `true` |
 | `ASC_RATE_LIMIT_PER_HOUR` | hayır | Saatlik pacing bütçesini Apple'ın 3.600'ünün altına çeker. Her süreç kendini anahtarın tek istemcisi sanarak pacing yapar; tek takım anahtarını paylaşan birden çok ajan kotayı birlikte yakar — her birine bir dilim verin |
 | `ASC_RATE_LIMIT_PER_MINUTE` | hayır | Dakikalık pencere için aynısı (varsayılan 300) |
+| `ASC_JWT_LIFETIME_SECONDS` | hayır | Yeni App Store Connect JWT'lerinin ömrü. 300 ile 1.199 arasında bir tamsayı olmalıdır (varsayılan 1.080); Apple'ın 1.200 saniyelik sınırı reddedilir |
+| `ASC_AUTH_RETRY_DELAY_MS` | hayır | Salt-okunur 401 kurtarma denemesinden önceki gecikme. 0 ile 60.000 milisaniye arasında bir tamsayı olmalıdır (varsayılan 8.000) |
 | `ASC_CONFIG_DIR` | hayır | Ortak yapılandırma dizinini değiştir (varsayılan `~/.config/asc-mcp`) |
 
 \* Özel anahtarı tam olarak tek bir yolla verin. Birden fazlası set edilmişse öncelik: `ASC_PRIVATE_KEY` (inline) → `ASC_PRIVATE_KEY_KEYCHAIN` → `ASC_PRIVATE_KEY_PATH`. Env kimlik bilgileri ortak yapılandırma dosyasını tümüyle ezer, böylece iki hesabı yanlışlıkla karıştıramazsınız.
+
+**Kimlik doğrulama kurtarma.** 401 dönen bir GET veya HEAD, `ASC_AUTH_RETRY_DELAY_MS`
+kadar bekler, önbelleğe alınmış JWT'yi yeniler ve tam olarak bir kez tekrar dener.
+POST, PATCH ve DELETE isteklerinde 401 tekrar denenmez. Tekrar deneme de 401
+döndürürse Heimdall Apple'ın durumunu, issue listesini ve request ID'sini hatada
+korur; bunu anahtar, rol, sözleşme veya hesap durumu araştırılması gereken bir
+kimlik doğrulama/yetkilendirme sorunu olarak ele alın.
 
 **Anahtarı verme yöntemini seçme** — üçü de aynı sonucu verir; anahtarın ne kadar gizli kalmasını istediğinize göre seçin.
 

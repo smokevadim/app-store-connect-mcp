@@ -19,11 +19,17 @@ export const ASC_BASE_URL = `https://${ASC_HOST}`;
 
 const RETRYABLE = new Set([408, 429, 500, 502, 503, 504]);
 
+export const DEFAULT_AUTH_RETRY_DELAY_MS = 8_000;
+export const AUTH_RETRY_DELAY_MIN_MS = 0;
+export const AUTH_RETRY_DELAY_MAX_MS = 60_000;
+
 export interface HttpOptions {
   maxRetries?: number;
   timeoutMs?: number;
   rateLimit?: RateLimitOptions;
   baseUrl?: string;
+  /** Delay before the one permitted read-only 401 recovery attempt. */
+  authRetryDelayMs?: number;
 }
 
 export type Query = Record<string, string | number | boolean | string[] | undefined>;
@@ -36,6 +42,7 @@ export class AscHttpClient {
   private readonly baseUrl: string;
   private readonly allowedHost: string;
   private readonly allowedProtocol: string;
+  private readonly authRetryDelayMs: number;
   readonly limiter: RateLimiter;
 
   constructor(
@@ -50,6 +57,18 @@ export class AscHttpClient {
     // Pin the protocol too: https against Apple (the default), but a local
     // fixture server (ASC_BASE_URL=http://localhost:…) paginates over http.
     this.allowedProtocol = base.protocol;
+    const authRetryDelayMs = opts.authRetryDelayMs ?? DEFAULT_AUTH_RETRY_DELAY_MS;
+    if (
+      !Number.isSafeInteger(authRetryDelayMs) ||
+      authRetryDelayMs < AUTH_RETRY_DELAY_MIN_MS ||
+      authRetryDelayMs > AUTH_RETRY_DELAY_MAX_MS
+    ) {
+      throw new Error(
+        `Authentication retry delay must be an integer between ${AUTH_RETRY_DELAY_MIN_MS} and ` +
+          `${AUTH_RETRY_DELAY_MAX_MS} milliseconds.`
+      );
+    }
+    this.authRetryDelayMs = authRetryDelayMs;
     this.limiter = new RateLimiter(opts.rateLimit);
   }
 
@@ -92,8 +111,10 @@ export class AscHttpClient {
     const isWrite = method !== 'GET' && method !== 'HEAD';
 
     let lastError: unknown;
+    let retryCount = 0;
+    let authRetryUsed = false;
 
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+    for (;;) {
       await this.limiter.acquire();
 
       const controller = new AbortController();
@@ -124,9 +145,18 @@ export class AscHttpClient {
 
         const err = await toApiError(res);
 
+        if (res.status === 401 && !isWrite && !authRetryUsed) {
+          authRetryUsed = true;
+          await sleep(this.authRetryDelayMs);
+          this.tokens.refresh();
+          lastError = err;
+          continue;
+        }
+
         const retryable = RETRYABLE.has(res.status) && (!isWrite || res.status === 429);
-        if (retryable && attempt < this.maxRetries) {
-          await sleep(backoffMs(attempt, res.headers.get('retry-after')));
+        if (retryable && retryCount < this.maxRetries) {
+          await sleep(backoffMs(retryCount, res.headers.get('retry-after')));
+          retryCount++;
           lastError = err;
           continue;
         }
@@ -151,8 +181,9 @@ export class AscHttpClient {
           );
         }
 
-        if (attempt < this.maxRetries) {
-          await sleep(backoffMs(attempt, null));
+        if (retryCount < this.maxRetries) {
+          await sleep(backoffMs(retryCount, null));
+          retryCount++;
           lastError = new AscApiError(message, 0);
           continue;
         }

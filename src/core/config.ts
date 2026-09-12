@@ -1,7 +1,17 @@
 import { ConfigError } from './errors.js';
 import { readKeychainPassword } from './keychain.js';
 import { readSharedConfig } from './shared-config.js';
-import type { JwtCredentials } from './jwt.js';
+import {
+  DEFAULT_JWT_LIFETIME_SECONDS,
+  JWT_LIFETIME_MAX_SECONDS,
+  JWT_LIFETIME_MIN_SECONDS,
+  type JwtCredentials,
+} from './jwt.js';
+import {
+  AUTH_RETRY_DELAY_MAX_MS,
+  AUTH_RETRY_DELAY_MIN_MS,
+  DEFAULT_AUTH_RETRY_DELAY_MS,
+} from './http.js';
 import type { RateLimitOptions } from './rate-limit.js';
 
 export interface ServerConfig {
@@ -32,6 +42,10 @@ export interface ServerConfig {
    * fixture server. Host-pinning then pins to this origin instead of Apple's.
    */
   baseUrl?: string;
+  /** Lifetime of newly signed App Store Connect JWTs, in seconds. */
+  jwtLifetimeSeconds?: number;
+  /** Delay before the one permitted read-only 401 recovery attempt. */
+  authRetryDelayMs?: number;
   /**
    * Writes never reach Apple: each mutating call returns what WOULD have been
    * sent (method, path, query, body, risk) after passing validation. Reads run
@@ -62,6 +76,31 @@ function parseList(value: string | undefined): string[] | undefined {
     .map((s) => s.trim())
     .filter(Boolean);
   return items.length ? items : undefined;
+}
+
+function parseBoundedInteger(
+  raw: string | undefined,
+  name: string,
+  min: number,
+  max: number,
+  fallback: number
+): number {
+  if (raw === undefined) return fallback;
+
+  const trimmed = raw.trim();
+  const value = Number(trimmed);
+  if (
+    !trimmed ||
+    !Number.isSafeInteger(value) ||
+    value < min ||
+    value > max
+  ) {
+    throw new ConfigError(
+      `${name} must be an integer between ${min} and ${max}. ` +
+        `Unset it to use the default of ${fallback}.`
+    );
+  }
+  return value;
 }
 
 export function loadConfig(argv: string[] = process.argv.slice(2)): ServerConfig {
@@ -173,6 +212,20 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): ServerConfig
     includeDeprecated:
       flag('include-deprecated') || env.ASC_INCLUDE_DEPRECATED === 'true',
     baseUrl: env.ASC_BASE_URL || undefined,
+    jwtLifetimeSeconds: parseBoundedInteger(
+      env.ASC_JWT_LIFETIME_SECONDS,
+      'ASC_JWT_LIFETIME_SECONDS',
+      JWT_LIFETIME_MIN_SECONDS,
+      JWT_LIFETIME_MAX_SECONDS,
+      DEFAULT_JWT_LIFETIME_SECONDS
+    ),
+    authRetryDelayMs: parseBoundedInteger(
+      env.ASC_AUTH_RETRY_DELAY_MS,
+      'ASC_AUTH_RETRY_DELAY_MS',
+      AUTH_RETRY_DELAY_MIN_MS,
+      AUTH_RETRY_DELAY_MAX_MS,
+      DEFAULT_AUTH_RETRY_DELAY_MS
+    ),
     dryRun: flag('dry-run') || env.ASC_DRY_RUN === 'true' || env.ASC_DRY_RUN === '1',
     rateLimit:
       requestsPerHour || requestsPerMinute ? { requestsPerHour, requestsPerMinute } : undefined,

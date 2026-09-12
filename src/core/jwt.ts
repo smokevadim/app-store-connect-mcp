@@ -7,7 +7,9 @@
 import { createSign, createPrivateKey, type KeyObject } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
-const TOKEN_LIFETIME_SEC = 20 * 60; // Apple's maximum
+export const DEFAULT_JWT_LIFETIME_SECONDS = 1_080;
+export const JWT_LIFETIME_MIN_SECONDS = 300;
+export const JWT_LIFETIME_MAX_SECONDS = 1_199;
 const REFRESH_LEEWAY_SEC = 90;
 
 export interface JwtCredentials {
@@ -17,6 +19,11 @@ export interface JwtCredentials {
   privateKeyPath?: string;
   /** PEM contents, as an alternative to privateKeyPath. */
   privateKey?: string;
+}
+
+export interface TokenProviderOptions {
+  /** Lifetime of a signed App Store Connect token. */
+  lifetimeSeconds?: number;
 }
 
 function base64url(input: Buffer | string): string {
@@ -60,10 +67,27 @@ export class TokenProvider {
   // the first real API call instead of blocking startup.
   private key?: KeyObject;
   private cached?: { token: string; expiresAt: number };
+  private readonly lifetimeSeconds: number;
 
-  constructor(private readonly creds: JwtCredentials) {
+  constructor(
+    private readonly creds: JwtCredentials,
+    options: TokenProviderOptions = {}
+  ) {
     if (!creds.keyId) throw new Error('Missing key ID (ASC_KEY_ID).');
     if (!creds.issuerId) throw new Error('Missing issuer ID (ASC_ISSUER_ID).');
+
+    const lifetimeSeconds = options.lifetimeSeconds ?? DEFAULT_JWT_LIFETIME_SECONDS;
+    if (
+      !Number.isSafeInteger(lifetimeSeconds) ||
+      lifetimeSeconds < JWT_LIFETIME_MIN_SECONDS ||
+      lifetimeSeconds > JWT_LIFETIME_MAX_SECONDS
+    ) {
+      throw new Error(
+        `JWT lifetime must be an integer between ${JWT_LIFETIME_MIN_SECONDS} and ` +
+          `${JWT_LIFETIME_MAX_SECONDS} seconds.`
+      );
+    }
+    this.lifetimeSeconds = lifetimeSeconds;
   }
 
   private getKey(): KeyObject {
@@ -83,7 +107,7 @@ export class TokenProvider {
   /** Discards the cached token and signs a fresh one. */
   refresh(): string {
     this.cached = undefined;
-    return this.getToken();
+    return this.mint(Math.floor(Date.now() / 1000));
   }
 
   status(): { cached: boolean; expiresInSeconds: number | null } {
@@ -93,7 +117,7 @@ export class TokenProvider {
   }
 
   private mint(now: number): string {
-    const exp = now + TOKEN_LIFETIME_SEC;
+    const exp = now + this.lifetimeSeconds;
 
     const header = base64url(
       JSON.stringify({ alg: 'ES256', kid: this.creds.keyId, typ: 'JWT' })

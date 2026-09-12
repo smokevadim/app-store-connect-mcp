@@ -23,7 +23,9 @@ function decodeSegment(segment: string): any {
 }
 
 describe('TokenProvider', () => {
-  it('signs a verifiable ES256 token with the fields Apple requires', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('signs a verifiable ES256 token with the fields Apple requires by default', () => {
     const token = new TokenProvider(creds).getToken();
     const [header, payload, signature] = token.split('.');
 
@@ -36,7 +38,7 @@ describe('TokenProvider', () => {
     const claims = decodeSegment(payload);
     expect(claims.iss).toBe(creds.issuerId);
     expect(claims.aud).toBe('appstoreconnect-v1');
-    expect(claims.exp - claims.iat).toBe(1200); // Apple's 20-minute maximum
+    expect(claims.exp - claims.iat).toBe(1080);
 
     const verifier = createVerify('SHA256');
     verifier.update(`${header}.${payload}`);
@@ -48,18 +50,32 @@ describe('TokenProvider', () => {
     expect(ok).toBe(true);
   });
 
+  it('uses a configured lifetime while preserving the required claims', () => {
+    const token = new TokenProvider(creds, { lifetimeSeconds: 1199 }).getToken();
+    const claims = decodeSegment(token.split('.')[1]);
+
+    expect(claims.iss).toBe(creds.issuerId);
+    expect(claims.aud).toBe('appstoreconnect-v1');
+    expect(claims.exp - claims.iat).toBe(1199);
+  });
+
   it('reuses a cached token until it nears expiry', () => {
     const provider = new TokenProvider(creds);
     expect(provider.getToken()).toBe(provider.getToken());
     expect(provider.status().cached).toBe(true);
   });
 
-  it('mints a new token after refresh()', () => {
+  it('mints a fresh token after refresh() without backdating iat', () => {
     const provider = new TokenProvider(creds);
+    const now = new Date('2026-09-12T22:00:00.000Z');
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+
     const first = provider.getToken();
-    vi.setSystemTime(new Date(Date.now() + 2000));
-    expect(provider.refresh()).not.toBe(first);
-    vi.useRealTimers();
+    const refreshed = provider.refresh();
+
+    expect(refreshed).not.toBe(first);
+    expect(decodeSegment(refreshed.split('.')[1]).iat).toBe(Math.floor(now.getTime() / 1000));
   });
 
   it('rejects a missing key with an actionable message', () => {
@@ -130,10 +146,14 @@ describe('AscHttpClient retry policy (a resent write can duplicate a resource)',
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
-  const fail = (status: number) =>
-    new Response(JSON.stringify({ errors: [] }), {
+  const fail = (
+    status: number,
+    body: unknown = { errors: [] },
+    headers: Record<string, string> = {}
+  ) =>
+    new Response(JSON.stringify(body), {
       status,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...headers },
     });
 
   beforeEach(() => vi.useFakeTimers());
@@ -148,6 +168,70 @@ describe('AscHttpClient retry policy (a resent write can duplicate a resource)',
     await vi.runAllTimersAsync();
     return p;
   }
+
+  it.each(['GET', 'HEAD'])('waits before refreshing and retrying a %s after 401', async (method) => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      fail(401, { errors: [{ code: 'NOT_AUTHORIZED', detail: 'retry once' }] })
+    ).mockResolvedValueOnce(ok());
+    vi.stubGlobal('fetch', fetchMock);
+    const provider = new TokenProvider(creds);
+    const client = new AscHttpClient(provider, {
+      maxRetries: 0,
+      authRetryDelayMs: 8000,
+    });
+
+    const request = client.request(method, '/v1/apps');
+    await vi.advanceTimersByTimeAsync(7999);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await request;
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstInit = fetchMock.mock.calls[0][1] as RequestInit;
+    const secondInit = fetchMock.mock.calls[1][1] as RequestInit;
+    expect((firstInit.headers as Record<string, string>).Authorization).not.toBe(
+      (secondInit.headers as Record<string, string>).Authorization
+    );
+  });
+
+  it('preserves the final structured Apple error after one failed 401 retry', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(fail(401, { errors: [{ code: 'NOT_AUTHORIZED', detail: 'stale token' }] }))
+      .mockResolvedValueOnce(
+        fail(
+          401,
+          { errors: [{ code: 'NOT_AUTHORIZED', title: 'Unauthorized', detail: 'final token rejected' }] },
+          { 'x-request-id': 'request-final-401' }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new AscHttpClient(new TokenProvider(creds), {
+      maxRetries: 0,
+      authRetryDelayMs: 0,
+    });
+
+    await expect(settle(client.get('/v1/apps'))).rejects.toMatchObject({
+      status: 401,
+      requestId: 'request-final-401',
+      errors: [{ code: 'NOT_AUTHORIZED', detail: 'final token rejected' }],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['POST', 'PATCH', 'DELETE'])('does not retry a %s after 401', async (method) => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      fail(401, { errors: [{ code: 'NOT_AUTHORIZED' }] })
+    ).mockResolvedValueOnce(ok());
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new AscHttpClient(new TokenProvider(creds), {
+      maxRetries: 3,
+      authRetryDelayMs: 0,
+    });
+
+    await expect(settle(client.request(method, '/v1/apps', { body: {} }))).rejects.toThrow(/401/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 
   it('retries a GET that hits a 500', async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(fail(500)).mockResolvedValueOnce(ok());

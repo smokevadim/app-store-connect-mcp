@@ -121,3 +121,42 @@ describe('loadConfig rateLimit', () => {
     expect(loadConfig([]).rateLimit).toBeUndefined();
   });
 });
+
+describe('loadConfig authentication settings', () => {
+  beforeEach(() => {
+    process.env.ASC_PRIVATE_KEY = 'INLINE_PEM';
+  });
+
+  it('uses safe defaults when authentication settings are absent', () => {
+    const config = loadConfig([]);
+
+    expect(config.jwtLifetimeSeconds).toBe(1080);
+    expect(config.authRetryDelayMs).toBe(8000);
+  });
+
+  it('accepts the documented inclusive bounds', () => {
+    process.env.ASC_JWT_LIFETIME_SECONDS = '300';
+    process.env.ASC_AUTH_RETRY_DELAY_MS = '0';
+    expect(loadConfig([])).toMatchObject({ jwtLifetimeSeconds: 300, authRetryDelayMs: 0 });
+
+    process.env.ASC_JWT_LIFETIME_SECONDS = '1199';
+    process.env.ASC_AUTH_RETRY_DELAY_MS = '60000';
+    expect(loadConfig([])).toMatchObject({ jwtLifetimeSeconds: 1199, authRetryDelayMs: 60000 });
+  });
+
+  it.each([
+    ['ASC_JWT_LIFETIME_SECONDS', '299'],
+    ['ASC_JWT_LIFETIME_SECONDS', '1200'],
+    ['ASC_JWT_LIFETIME_SECONDS', '1080.5'],
+    ['ASC_JWT_LIFETIME_SECONDS', 'not-a-number'],
+    ['ASC_AUTH_RETRY_DELAY_MS', '-1'],
+    ['ASC_AUTH_RETRY_DELAY_MS', '60001'],
+    ['ASC_AUTH_RETRY_DELAY_MS', '8000.5'],
+    ['ASC_AUTH_RETRY_DELAY_MS', 'not-a-number'],
+  ])('rejects unsafe %s=%s with an actionable error', (name, value) => {
+    process.env[name] = value;
+
+    expect(() => loadConfig([])).toThrow(new RegExp(name));
+    expect(readKeychainPassword).not.toHaveBeenCalled();
+  });
+});
