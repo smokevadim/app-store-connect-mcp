@@ -1,0 +1,515 @@
+import { ALL_DOMAINS } from '../core/registry.js';
+import { DOMAIN_DESCRIPTIONS } from '../generated/domain-info.js';
+import { OPERATIONS, SPEC_VERSION } from '../generated/operations.js';
+import { STOREKIT_TOOLS } from '../storekit/index.js';
+import { PRICING_TOOLS } from './pricing.js';
+import { SCREENSHOT_TOOLS } from './screenshots.js';
+import { AscApiError } from '../core/errors.js';
+export const META_TOOLS = [
+    {
+        name: 'asc__discover_domains',
+        description: 'List what this server can reach and what it cannot: in profile mode the profiles ' +
+            'and sub-profiles that exist, which are loaded here, and how many tools each holds; ' +
+            'otherwise the tool domains. Use this when a capability you need is not in the tool list.',
+        inputSchema: { type: 'object', properties: {} },
+        annotations: { readOnlyHint: true },
+    },
+    {
+        name: 'asc__search_tools',
+        description: 'Search all App Store Connect operations by keyword, including domains that are ' +
+            'not currently loaded. Returns matching tool names, their domain, and the ' +
+            'underlying endpoint. Search in English: tool names and descriptions are ' +
+            'generated from Apple’s English spec, so translate the goal before searching.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                query: {
+                    type: 'string',
+                    description: 'English keywords to match against tool names, descriptions and paths. ' +
+                        'A query in another language matches nothing.',
+                },
+                limit: { type: 'number', description: 'Maximum results (default 25).' },
+            },
+            required: ['query'],
+        },
+        annotations: { readOnlyHint: true },
+    },
+    {
+        name: 'asc__status',
+        description: 'Report server configuration, spec version, loaded domains, JWT token state ' +
+            'and remaining API rate limit. Also verifies credentials against Apple with a ' +
+            'single lightweight request.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                check_connection: {
+                    type: 'boolean',
+                    description: 'Issue one real API call to verify credentials (default true).',
+                },
+                check_expirations: {
+                    type: 'boolean',
+                    description: 'Also list signing certificates and provisioning profiles expiring within 30 days ' +
+                        '(two extra API calls; default false).',
+                },
+                check_capabilities: {
+                    type: 'boolean',
+                    description: 'Also report what this API key can reach, by probing one cheap endpoint per role ' +
+                        'family (reports, metadata, reviews, user management, provisioning) and recording ' +
+                        'ok/forbidden/unauthorized per family — never the role name itself, which no ' +
+                        'endpoint returns. Up to five extra API calls, fewer when check_connection or ' +
+                        'check_expirations already covered part of it; default false. Call this once, ' +
+                        'before relying on a family, rather than discovering the gap from a 403 mid-task.',
+                },
+            },
+        },
+        annotations: { readOnlyHint: true },
+    },
+];
+/** Punctuation-aware split; a typed question arrives with "?" and "'" attached. */
+const WORDS = /[\s,.:;!?"'’()[\]]+/;
+/**
+ * `'İ'.toLowerCase()` is `i` followed by U+0307 COMBINING DOT ABOVE, not `i` —
+ * Unicode keeps the marks apart because `i` already carries a dot. A word typed
+ * on a Turkish keyboard therefore stops matching the catalogue's lowercase
+ * text. Dropping the mark is safe: the catalogue is Apple's English spec and
+ * contains no combining marks at all.
+ */
+const COMBINING_DOT_ABOVE = /̇/g;
+const tokenize = (query) => [
+    ...new Set(query.toLowerCase().replace(COMBINING_DOT_ABOVE, '').split(WORDS).filter(Boolean)),
+];
+/**
+ * A token this short is a fragment of something longer far more often than it
+ * is a word: `de` is inside `delete`, `le` inside `role`, `l` inside almost
+ * everything. Scoring those as hits let French stopwords outscore real terms —
+ * "le de l" ranked 390 operations, none of them about anything.
+ *
+ * Short tokens are not dropped, because some are the whole query a user means:
+ * `ci` is Xcode Cloud. They just have to appear as a word of their own.
+ */
+const SHORT_TOKEN = 3;
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/**
+ * Build the test for one token once, rather than per operation — a search
+ * walks every operation in the catalogue, and compiling the same pattern 982
+ * times is the kind of waste that only shows up under a profiler.
+ */
+function tokenTest(token) {
+    if (token.length >= SHORT_TOKEN)
+        return (haystack) => haystack.includes(token);
+    const word = new RegExp(`(?:^|[^a-z0-9])${escapeRegExp(token)}(?:[^a-z0-9]|$)`);
+    return (haystack) => word.test(haystack);
+}
+/**
+ * Keyword search over every operation (loaded or not). Extracted from the
+ * asc__search_tools handler so intent coverage is unit-testable — the intent
+ * regression suite in tests/search-intents.test.ts runs against this.
+ *
+ * Multi-word queries are matched token by token and ranked by how many tokens
+ * hit: the old whole-phrase `includes` returned nothing for natural queries
+ * like "change subscription price territory", because no description contains
+ * that exact phrase. Single-word queries behave as before.
+ *
+ * Matching is literal, and the catalogue is English, so a query in another
+ * language finds nothing. That is deliberate. It was briefly not: a hand-written
+ * Turkish-to-English word list sat here and translated a hundred or so nouns
+ * before matching. It worked, and it was the wrong place to solve the problem —
+ * every further language meant another hundred hand-typed rows that go stale
+ * whenever Apple adds resources, and the caller is a language model that already
+ * speaks all of them. The tool description now asks for English and an empty
+ * result says so; translation belongs to the client, which is better at it than
+ * any table we would maintain.
+ *
+ * Deprecated operations are excluded unless the server was started with
+ * `--include-deprecated`, because the registry refuses to load them either.
+ * Returning them looks helpful and is not: the agent reads "deprecated" as
+ * "works but discouraged", calls the tool, and gets "no such tool". Measured
+ * on "create leaderboard" — two of the top five were unreachable.
+ */
+/**
+ * How much of a tool's name the query did not ask about — the tie-break.
+ *
+ * Scoring counts how many query tokens land somewhere in name, description and
+ * path, so every sibling of a resource ties on a query about the resource:
+ * "Create a Game Center achievement" scores full marks on
+ * `game_center_achievements_v2.create` and on the achievement's images,
+ * localizations and releases alike. Ties then broke alphabetically, which put
+ * `game_center_achievement_images.create` first and the tool the query was
+ * about fourth — an ordering with no meaning behind it, and one that no
+ * description rewrite can beat, because the competitors match the same words
+ * for the same good reason.
+ *
+ * Equal coverage of the query is settled here by which name carries the least
+ * material the query never mentioned. `achievements_v2.create` has one such
+ * part; `achievement_localizations.create` has two. The query said achievement,
+ * not achievement localization, and the shorter name is the more direct answer.
+ *
+ * Measured on the 265-phrasing corpus: 125 queries found their tool in the top
+ * three before this and 136 after, with no query losing one it had.
+ */
+function unaskedNameParts(name, tokens) {
+    return name
+        .toLowerCase()
+        .split(/[._]/)
+        .filter((part) => !tokens.some((t) => part.includes(t) || t.includes(part))).length;
+}
+export function searchOperations(query, includeDeprecated = false) {
+    const tokens = tokenize(query);
+    if (!tokens.length)
+        return [];
+    const tests = tokens.map(tokenTest);
+    const pool = includeDeprecated ? OPERATIONS : OPERATIONS.filter((op) => !op.deprecated);
+    const scored = pool
+        .map((op) => {
+        const haystack = `${op.name} ${op.description} ${op.path}`.toLowerCase();
+        const score = tests.reduce((n, hit) => n + (hit(haystack) ? 1 : 0), 0);
+        return { op, score, extra: unaskedNameParts(op.name, tokens) };
+    })
+        .filter((s) => s.score > 0 && s.score >= Math.ceil(tokens.length / 2));
+    return scored
+        .sort((a, b) => b.score - a.score || a.extra - b.extra || a.op.name.localeCompare(b.op.name))
+        .map((s) => s.op);
+}
+/**
+ * The same token rule `searchOperations` uses, for the tool lists that are not
+ * generated from the spec. They used to be matched with a whole-phrase
+ * `includes`, which meant a real question never found them: "change
+ * subscription price" is not a substring of any description.
+ */
+function matchByToken(query, tools) {
+    const tokens = tokenize(query);
+    if (!tokens.length)
+        return [];
+    const tests = tokens.map(tokenTest);
+    const need = Math.ceil(tokens.length / 2);
+    return tools
+        .map((t) => {
+        const haystack = `${t.name} ${t.description}`.toLowerCase();
+        return { t, score: tests.reduce((n, hit) => n + (hit(haystack) ? 1 : 0), 0) };
+    })
+        .filter((s) => s.score >= need)
+        .sort((a, b) => b.score - a.score)
+        .map((s) => s.t);
+}
+/** Days ahead that counts as "expiring soon" for certificates and profiles. */
+const EXPIRY_WINDOW_DAYS = 30;
+/**
+ * Summarises expirations from certificates__list / profiles__list responses.
+ * Pure — exported for tests.
+ */
+export function summarizeExpirations(certificates, profiles, now = Date.now()) {
+    const cutoff = now + EXPIRY_WINDOW_DAYS * 86_400_000;
+    const pick = (items, nameAttr) => items
+        .filter((i) => {
+        const exp = Date.parse(i?.attributes?.expirationDate ?? '');
+        return Number.isFinite(exp) && exp <= cutoff;
+    })
+        .map((i) => ({
+        id: String(i.id),
+        name: String(i.attributes?.[nameAttr] ?? i.attributes?.name ?? ''),
+        expirationDate: String(i.attributes?.expirationDate ?? ''),
+    }))
+        .sort((a, b) => a.expirationDate.localeCompare(b.expirationDate));
+    const certSoon = pick(certificates, 'displayName');
+    const profSoon = pick(profiles, 'name');
+    const parts = [];
+    parts.push(certSoon.length
+        ? `${certSoon.length} certificate(s) expire within ${EXPIRY_WINDOW_DAYS} days`
+        : `No certificates expiring within ${EXPIRY_WINDOW_DAYS} days`);
+    parts.push(profSoon.length
+        ? `${profSoon.length} provisioning profile(s) expire within ${EXPIRY_WINDOW_DAYS} days`
+        : `no profiles either`);
+    return {
+        certificates: { total: certificates.length, expiringSoon: certSoon },
+        profiles: { total: profiles.length, expiringSoon: profSoon },
+        summary: parts.join('; ') + '.',
+    };
+}
+/**
+ * Apple's role split does not line up with the shape of the work: the
+ * Analytics Reports API answers only to Admin, Finance or Sales (Access to
+ * Reports), first requesting a report type is Admin-only with no path to it
+ * in the App Store Connect UI, and metadata plus customer reviews want Admin
+ * or App Manager. None of that is in any response body — a role is chosen
+ * when a team key is created and never read back, and an individual key
+ * silently inherits its creator's roles and app restrictions. So a session
+ * only learns its key is narrow when a 403 lands mid-task, and reads that as
+ * the tool being broken rather than the key being scoped. This is the probe:
+ * one cheap GET per family, asked once, up front.
+ */
+function classifyProbe(err) {
+    const status = err?.status;
+    if (status === 401)
+        return 'unauthorized';
+    // An unsigned agreement is a 403 too, and reporting it as a narrow key is
+    // the one wrong answer that costs a credential rotation to disprove.
+    if (err instanceof AscApiError && err.requiresAgreement)
+        return 'agreement';
+    if (status === 403)
+        return 'forbidden';
+    // status 0 is a network failure that never reached Apple; anything else
+    // (5xx, an unrecognised shape) is inconclusive rather than a denial.
+    return 'unknown';
+}
+/** Exported for the test: the classification is the decision worth pinning. */
+export const classifyProbeForTest = classifyProbe;
+async function probeFamily(http, path) {
+    try {
+        await http.get(path, { limit: 1 });
+        return 'ok';
+    }
+    catch (err) {
+        return classifyProbe(err);
+    }
+}
+function summarizeCapabilities(states) {
+    const families = [
+        ['reports', states.reports],
+        ['metadata', states.metadata],
+        ['reviews', states.reviews],
+        ['user management', states.userManagement],
+        ['provisioning', states.provisioning],
+    ];
+    const denied = families.filter(([, s]) => s === 'forbidden').map(([n]) => n);
+    const blocked = families.filter(([, s]) => s === 'agreement').map(([n]) => n);
+    const unclear = families.filter(([, s]) => s === 'unknown').map(([n]) => n);
+    const parts = [];
+    if (blocked.length) {
+        parts.push(`${blocked.join(', ')} blocked by an unsigned or expired agreement, which only the ` +
+            'Account Holder can accept at https://developer.apple.com/account');
+    }
+    parts.push(denied.length ? `no access to ${denied.join(', ')}` : 'no denials among the families probed');
+    if (unclear.length)
+        parts.push(`${unclear.join(', ')} inconclusive — re-run to be sure`);
+    return `${parts.join('; ')}.`;
+}
+/**
+ * Runs the five family probes and folds in whatever the caller already knows
+ * from `check_connection` (the baseline call) and `check_expirations` (the
+ * certificates call) so `check_capabilities` never repeats a request the same
+ * `asc__status` call already made.
+ *
+ * A baseline of `unauthorized` short-circuits: the key itself is not
+ * authenticating, so every family probe would fail the same way for the same
+ * reason, and running five more requests to confirm that once each spends
+ * calls to learn nothing new.
+ */
+export async function probeCapabilities(http, baseline, appId, certificatesProbe) {
+    if (baseline === 'unauthorized' || baseline === 'agreement') {
+        const states = {
+            baseline,
+            reports: baseline,
+            metadata: baseline,
+            reviews: baseline,
+            userManagement: baseline,
+            provisioning: baseline,
+        };
+        return {
+            ...states,
+            summary: baseline === 'agreement'
+                ? 'The account has an unsigned or expired agreement, so every family is blocked for ' +
+                    'that reason and none was probed. Only the Account Holder can accept it, at ' +
+                    'https://developer.apple.com/account — the key and its roles are not the problem.'
+                : 'The API key itself is not authenticating; nothing else was probed.',
+        };
+    }
+    // App-scoped families have nothing to probe without an app id — that is
+    // itself the "no app to cover the probe" case `unknown` exists for, not a
+    // reason to guess.
+    const appScoped = (path) => appId ? probeFamily(http, path) : Promise.resolve('unknown');
+    const [reports, metadata, reviews, userManagement, provisioning] = await Promise.all([
+        appScoped(`/v1/apps/${encodeURIComponent(appId ?? '')}/analyticsReportRequests`),
+        appScoped(`/v1/apps/${encodeURIComponent(appId ?? '')}/appInfos`),
+        appScoped(`/v1/apps/${encodeURIComponent(appId ?? '')}/customerReviews`),
+        probeFamily(http, '/v1/users'),
+        certificatesProbe ?? probeFamily(http, '/v1/certificates'),
+    ]);
+    const states = { baseline, reports, metadata, reviews, userManagement, provisioning };
+    return { ...states, summary: summarizeCapabilities(states) };
+}
+export async function executeMetaTool(name, args, ctx) {
+    switch (name) {
+        case 'asc__discover_domains': {
+            // Profile mode answers in profiles, not domains: registering a sibling
+            // server is the actual remedy, and a domain no longer names one server.
+            if (ctx.profileReport) {
+                return {
+                    specVersion: SPEC_VERSION,
+                    totalOperations: OPERATIONS.length,
+                    loadedTools: ctx.registry.size,
+                    ...ctx.profileReport(),
+                };
+            }
+            const counts = OPERATIONS.reduce((acc, op) => {
+                acc[op.domain] = (acc[op.domain] ?? 0) + 1;
+                return acc;
+            }, {});
+            const unloaded = new Set(ctx.registry.unloadedDomains());
+            return {
+                specVersion: SPEC_VERSION,
+                totalOperations: OPERATIONS.length,
+                loadedTools: ctx.registry.size,
+                domains: ALL_DOMAINS.map((domain) => ({
+                    domain,
+                    tools: counts[domain] ?? 0,
+                    loaded: !unloaded.has(domain),
+                    description: DOMAIN_DESCRIPTIONS[domain] ?? '',
+                })),
+                hint: unloaded.size > 0
+                    ? `To load more, restart the server with --domains=${[...unloaded].slice(0, 3).join(',')} ` +
+                        `(or --domains=all for every operation).`
+                    : 'All domains are loaded.',
+            };
+        }
+        case 'asc__search_tools': {
+            const query = String(args.query ?? '').toLowerCase();
+            const limit = Number(args.limit ?? 25);
+            if (!query)
+                return { matches: [], count: 0 };
+            const apiHits = searchOperations(query, ctx.includeDeprecated);
+            const apiMatches = apiHits.map((op) => ({
+                tool: op.name,
+                domain: op.domain,
+                endpoint: `${op.method} ${op.path}`,
+                description: op.description,
+                loaded: Boolean(ctx.registry.get(op.name)),
+                deprecated: op.deprecated,
+            }));
+            // Neither StoreKit nor the macros come from the OpenAPI spec, so both are
+            // invisible to a search over OPERATIONS. The macros are the costly half:
+            // a model searching "change subscription price" found only the five-call
+            // chain, never the one-call tool written to replace it.
+            const extras = (tools, domain, endpoint, loaded) => matchByToken(query, tools).map((t) => ({
+                tool: t.name,
+                domain,
+                endpoint,
+                description: t.description,
+                loaded: loaded(t.name),
+                deprecated: false,
+            }));
+            // Ahead of the generated tools, not after them. There are twelve of these
+            // against 982, so appending buried them below the slice — which is how a
+            // macro written to replace a five-call chain lost to the five calls. A
+            // macro that matches the query is the answer to it.
+            const matches = [
+                ...extras([...PRICING_TOOLS, ...SCREENSHOT_TOOLS], 'macro', 'Heimdall macro', (name) => Boolean(ctx.macroOffered?.(name))),
+                ...extras(STOREKIT_TOOLS, 'storekit', 'App Store Server API', () => Boolean(ctx.storekitEnabled)),
+                ...apiMatches,
+            ].slice(0, Math.max(1, Math.min(limit, 100)));
+            // An empty list reads as "no such capability", and the agent acts on it —
+            // AI-201 ended with a model concluding App Store Connect could not set a
+            // price and reaching for a competitor's server instead. Say why nothing
+            // matched, because the two likely reasons have opposite remedies.
+            if (!matches.length) {
+                return {
+                    matches: [],
+                    count: 0,
+                    hint: `Nothing matched "${query}". This is a literal keyword search over Apple's ` +
+                        `English spec: a query in any other language matches nothing, so translate it ` +
+                        `and search again. If it was already English, search the resource rather than ` +
+                        `the sentence — "subscription price", "beta group", "screenshot".`,
+                };
+            }
+            // A match the caller cannot invoke is a dead end unless we say how to
+            // reach it — the tool only appears after the server restarts.
+            const unloaded = matches.filter((m) => !m.loaded);
+            const unloadedApiDomains = [...new Set(unloaded.filter((m) => m.domain !== 'storekit').map((m) => m.domain))];
+            const storekitUnloaded = unloaded.some((m) => m.domain === 'storekit');
+            const hints = [];
+            if (unloadedApiDomains.length) {
+                const unloadedOps = apiHits.filter((op) => matches.some((m) => m.tool === op.name && !m.loaded));
+                hints.push(ctx.missingToolsHint?.(unloadedOps) ??
+                    `Restart the server with --domains=${unloadedApiDomains.join(',')} ` +
+                        `(added to any domains you already load) to expose them.`);
+            }
+            if (storekitUnloaded) {
+                hints.push('StoreKit tools need the monetization profile with ASC_BUNDLE_ID set ' +
+                    '(run `npx -y @erayendes/asc-mcp setup` and pick the monetization profile, or set ASC_BUNDLE_ID).');
+            }
+            return {
+                matches,
+                count: matches.length,
+                ...(hints.length
+                    ? {
+                        hint: `${unloaded.length} of these are not loaded and cannot be called from this server. ` +
+                            hints.join(' '),
+                    }
+                    : {}),
+            };
+        }
+        case 'asc__status': {
+            const checkConnection = args.check_connection !== false;
+            const checkExpirations = args.check_expirations === true;
+            const checkCapabilities = args.check_capabilities === true;
+            const result = {
+                specVersion: SPEC_VERSION,
+                loadedDomains: ctx.loadedDomains,
+                loadedTools: ctx.registry.size,
+                totalOperations: OPERATIONS.length,
+                readOnly: ctx.readOnly,
+                // Nobody weighs a context budget during setup; they weigh it when a
+                // session starts filling up. That is the moment this answer is read.
+                ...(ctx.profileReport?.() ?? {}),
+                token: ctx.tokens.status(),
+                rateLimit: ctx.http.limiter.status(),
+            };
+            // check_capabilities' baseline probe and check_connection's own check
+            // are the same request (GET /v1/apps?limit=1), so this runs it once for
+            // either or both — and is where the capability probes get the app id
+            // they scope three of the five families to.
+            let appId;
+            let baselineProbe;
+            if (checkConnection || checkCapabilities) {
+                try {
+                    const res = await ctx.http.get('/v1/apps', { limit: 1 });
+                    appId = res?.data?.[0]?.id;
+                    baselineProbe = 'ok';
+                    if (checkConnection) {
+                        result.connection = {
+                            ok: true,
+                            appsVisible: res?.meta?.paging?.total ?? res?.data?.length ?? 0,
+                        };
+                    }
+                }
+                catch (err) {
+                    baselineProbe = classifyProbe(err);
+                    if (checkConnection) {
+                        result.connection = { ok: false, error: err.message };
+                    }
+                }
+            }
+            // Certificates are fetched here (limit 200) when expirations were
+            // asked for; check_capabilities' provisioning probe below reuses this
+            // outcome instead of firing its own limit:1 request at the same
+            // endpoint.
+            let certificatesProbe;
+            if (checkExpirations) {
+                // Two extra calls, so opt-in only. A key without the provisioning role
+                // gets a 403 here — report it instead of failing the whole status.
+                try {
+                    const [certs, profiles] = await Promise.all([
+                        ctx.http.get('/v1/certificates', { limit: 200 }),
+                        ctx.http.get('/v1/profiles', { limit: 200 }),
+                    ]);
+                    certificatesProbe = 'ok';
+                    result.expirations = summarizeExpirations(certs?.data ?? [], profiles?.data ?? []);
+                }
+                catch (err) {
+                    certificatesProbe = classifyProbe(err);
+                    result.expirations = { error: err.message };
+                }
+            }
+            if (checkCapabilities) {
+                // baselineProbe is always set by this point: the block above runs
+                // whenever checkCapabilities is true, whether or not checkConnection
+                // is also true.
+                result.capabilities = await probeCapabilities(ctx.http, baselineProbe, appId, certificatesProbe);
+            }
+            return result;
+        }
+        default:
+            throw new Error(`Unknown meta tool: ${name}`);
+    }
+}
+export const META_TOOL_NAMES = new Set(META_TOOLS.map((t) => t.name));
+//# sourceMappingURL=meta.js.map

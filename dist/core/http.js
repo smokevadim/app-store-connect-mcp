@@ -1,0 +1,405 @@
+import { RateLimiter } from './rate-limit.js';
+import { AscApiError } from './errors.js';
+export const ASC_HOST = 'api.appstoreconnect.apple.com';
+export const ASC_BASE_URL = `https://${ASC_HOST}`;
+const RETRYABLE = new Set([408, 429, 500, 502, 503, 504]);
+export const DEFAULT_AUTH_RETRY_DELAY_MS = 8_000;
+export const AUTH_RETRY_DELAY_MIN_MS = 0;
+export const AUTH_RETRY_DELAY_MAX_MS = 60_000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+export class AscHttpClient {
+    tokens;
+    maxRetries;
+    timeoutMs;
+    baseUrl;
+    allowedHost;
+    allowedProtocol;
+    authRetryDelayMs;
+    limiter;
+    constructor(tokens, opts = {}) {
+        this.tokens = tokens;
+        this.maxRetries = opts.maxRetries ?? 3;
+        this.timeoutMs = opts.timeoutMs ?? 60_000;
+        this.baseUrl = (opts.baseUrl ?? ASC_BASE_URL).replace(/\/$/, '');
+        const base = new URL(this.baseUrl);
+        this.allowedHost = base.host;
+        // Pin the protocol too: https against Apple (the default), but a local
+        // fixture server (ASC_BASE_URL=http://localhost:…) paginates over http.
+        this.allowedProtocol = base.protocol;
+        const authRetryDelayMs = opts.authRetryDelayMs ?? DEFAULT_AUTH_RETRY_DELAY_MS;
+        if (!Number.isSafeInteger(authRetryDelayMs) ||
+            authRetryDelayMs < AUTH_RETRY_DELAY_MIN_MS ||
+            authRetryDelayMs > AUTH_RETRY_DELAY_MAX_MS) {
+            throw new Error(`Authentication retry delay must be an integer between ${AUTH_RETRY_DELAY_MIN_MS} and ` +
+                `${AUTH_RETRY_DELAY_MAX_MS} milliseconds.`);
+        }
+        this.authRetryDelayMs = authRetryDelayMs;
+        this.limiter = new RateLimiter(opts.rateLimit);
+    }
+    /**
+     * Resolves a `links.next` URL returned by Apple.
+     * Rejects anything pointing off-host — a redirected pagination cursor must
+     * never be able to walk our bearer token to a third party.
+     */
+    resolvePaginationUrl(raw) {
+        let url;
+        try {
+            url = new URL(raw);
+        }
+        catch {
+            throw new AscApiError(`Malformed pagination URL: ${raw}`, 0);
+        }
+        if (url.protocol !== this.allowedProtocol || url.host !== this.allowedHost) {
+            throw new AscApiError(`Refusing to follow pagination URL to unexpected host "${url.host}". ` +
+                `Only ${this.allowedHost} is allowed.`, 0);
+        }
+        return url;
+    }
+    async request(method, path, opts = {}) {
+        const url = /^https?:\/\//.test(path)
+            ? this.resolvePaginationUrl(path)
+            : new URL(this.baseUrl + (path.startsWith('/') ? path : `/${path}`));
+        if (opts.query)
+            applyQuery(url, opts.query);
+        // Writes may not be idempotent (a resent POST can create a second version,
+        // IAP or price entry), so they only retry when Apple provably did not
+        // process the request — a 429 rate rejection. Reads retry freely.
+        const isWrite = method !== 'GET' && method !== 'HEAD';
+        let lastError;
+        let retryCount = 0;
+        let authRetryUsed = false;
+        for (;;) {
+            await this.limiter.acquire();
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+            try {
+                const res = await fetch(url, {
+                    method,
+                    headers: {
+                        Authorization: `Bearer ${this.tokens.getToken()}`,
+                        Accept: opts.accept ?? 'application/json',
+                        ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
+                    },
+                    body: opts.body ? JSON.stringify(opts.body) : undefined,
+                    signal: controller.signal,
+                });
+                this.limiter.observeHeader(res.headers.get('x-rate-limit'));
+                if (res.ok) {
+                    if (res.status === 204)
+                        return undefined;
+                    const contentType = res.headers.get('content-type') ?? '';
+                    if (contentType.includes('json'))
+                        return (await res.json());
+                    // Sales and finance reports come back as gzipped TSV.
+                    const buf = Buffer.from(await res.arrayBuffer());
+                    return { contentType, base64: buf.toString('base64') };
+                }
+                const err = await toApiError(res);
+                if (res.status === 401 && !isWrite && !authRetryUsed) {
+                    authRetryUsed = true;
+                    await sleep(this.authRetryDelayMs);
+                    this.tokens.refresh();
+                    lastError = err;
+                    continue;
+                }
+                const retryable = RETRYABLE.has(res.status) && (!isWrite || res.status === 429);
+                if (retryable && retryCount < this.maxRetries) {
+                    await sleep(backoffMs(retryCount, res.headers.get('retry-after')));
+                    retryCount++;
+                    lastError = err;
+                    continue;
+                }
+                throw err;
+            }
+            catch (err) {
+                // A thrown AscApiError past the retry check is final.
+                if (err instanceof AscApiError)
+                    throw err;
+                const isAbort = err?.name === 'AbortError';
+                const message = isAbort
+                    ? `Request timed out after ${this.timeoutMs}ms`
+                    : `Network error: ${err.message}`;
+                // No response means we cannot know whether Apple processed the
+                // request. For a write, resending could apply it twice — report the
+                // unknown outcome instead of retrying or pretending it failed cleanly.
+                if (isWrite) {
+                    throw new AscApiError(`${message}. This ${method} request may or may not have been processed by ` +
+                        `Apple — verify whether the change was applied before sending it again.`, 0);
+                }
+                if (retryCount < this.maxRetries) {
+                    await sleep(backoffMs(retryCount, null));
+                    retryCount++;
+                    lastError = new AscApiError(message, 0);
+                    continue;
+                }
+                throw new AscApiError(message, 0);
+            }
+            finally {
+                clearTimeout(timer);
+            }
+        }
+        throw lastError ?? new AscApiError('Request failed', 0);
+    }
+    get(path, query) {
+        return this.request('GET', path, { query });
+    }
+    post(path, body) {
+        return this.request('POST', path, { body });
+    }
+    patch(path, body) {
+        return this.request('PATCH', path, { body });
+    }
+    delete(path, body) {
+        return this.request('DELETE', path, { body });
+    }
+    /**
+     * PUTs one slice of an asset to an upload URL Apple handed back in an
+     * `uploadOperations` array.
+     *
+     * Deliberately not `request()`. Every other call here carries the bearer
+     * token; these must not. The upload URLs are pre-signed and arrive with their
+     * own `requestHeaders`, so attaching our credential would hand it to a
+     * different host than the one it was minted for.
+     *
+     * That is also why the host is checked. `uploadOperations` is API-supplied
+     * data, not a user's input, and the body is a file off the user's disk — an
+     * unchecked URL there is a request to POST local files wherever the response
+     * says. Pagination already refuses to leave `allowedHost` for the same class
+     * of reason; uploads legitimately go to Apple's asset hosts rather than the
+     * API host, so the rule widens to Apple rather than disappearing. The base
+     * host stays allowed so ASC_BASE_URL can point tests at a fixture server.
+     */
+    async uploadAssetPart(op, body) {
+        let url;
+        try {
+            url = new URL(op.url);
+        }
+        catch {
+            throw new AscApiError(`Malformed upload URL: ${op.url}`, 0);
+        }
+        const appleHost = url.protocol === 'https:' && /(^|\.)apple\.com$/.test(url.hostname);
+        const fixtureHost = url.protocol === this.allowedProtocol && url.host === this.allowedHost;
+        if (!appleHost && !fixtureHost) {
+            throw new AscApiError(`Refusing to upload to "${url.host}": an upload URL must be an https Apple host ` +
+                `(or the configured ASC_BASE_URL). This one came back from the API — treat it ` +
+                `as a sign the response was not what it claimed.`, 0);
+        }
+        const headers = {};
+        for (const h of op.requestHeaders ?? []) {
+            if (h?.name && h.value !== undefined)
+                headers[h.name] = String(h.value);
+        }
+        await this.limiter.acquire();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+        try {
+            const res = await fetch(url, {
+                method: op.method || 'PUT',
+                headers,
+                body,
+                signal: controller.signal,
+            });
+            // No retry. A half-uploaded asset is fixed by re-reserving the whole
+            // thing, not by resending one slice into an unknown server-side state.
+            if (!res.ok)
+                throw await toApiError(res);
+        }
+        catch (err) {
+            if (err instanceof AscApiError)
+                throw err;
+            const isAbort = err?.name === 'AbortError';
+            throw new AscApiError(isAbort
+                ? `Upload timed out after ${this.timeoutMs}ms`
+                : `Upload network error: ${err.message}`, 0);
+        }
+        finally {
+            clearTimeout(timer);
+        }
+    }
+    /**
+     * GETs a pre-signed asset URL Apple handed back in a response body — an
+     * analytics report segment, for instance, where the rows live at the URL and
+     * not in the JSON.
+     *
+     * Same reasoning as `uploadAssetPart`: no bearer token, because the URL
+     * already carries its own signature and is not on the API host, and a host
+     * check because the URL is API-supplied data rather than something the user
+     * typed.
+     */
+    async downloadAsset(rawUrl, maxBytes = 64 * 1024 * 1024) {
+        let url;
+        try {
+            url = new URL(rawUrl);
+        }
+        catch {
+            throw new AscApiError(`Malformed asset URL: ${rawUrl}`, 0);
+        }
+        const appleHost = url.protocol === 'https:' && /(^|\.)apple\.com$/.test(url.hostname);
+        const fixtureHost = url.protocol === this.allowedProtocol && url.host === this.allowedHost;
+        if (!appleHost && !fixtureHost) {
+            throw new AscApiError(`Refusing to download from "${url.host}": an asset URL must be an https Apple host ` +
+                `(or the configured ASC_BASE_URL).`, 0);
+        }
+        await this.limiter.acquire();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+        try {
+            const res = await fetch(url, { signal: controller.signal });
+            if (!res.ok)
+                throw await toApiError(res);
+            // The cap has to bite before the bytes are in memory. Checking it after
+            // `arrayBuffer()` reads like a limit but is only a report: the oversized
+            // body has already been buffered by the time the number is known.
+            const declared = Number(res.headers.get('content-length'));
+            if (Number.isFinite(declared) && declared > maxBytes)
+                throw tooBig(declared, maxBytes);
+            if (!res.body)
+                return Buffer.alloc(0);
+            const reader = res.body.getReader();
+            const chunks = [];
+            let total = 0;
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done)
+                    break;
+                total += value.byteLength;
+                if (total > maxBytes) {
+                    // Stop the transfer rather than draining the rest of a body we have
+                    // already refused.
+                    await reader.cancel().catch(() => { });
+                    throw tooBig(total, maxBytes);
+                }
+                chunks.push(Buffer.from(value));
+            }
+            return Buffer.concat(chunks);
+        }
+        catch (err) {
+            if (err instanceof AscApiError)
+                throw err;
+            const isAbort = err?.name === 'AbortError';
+            throw new AscApiError(isAbort
+                ? `Download timed out after ${this.timeoutMs}ms`
+                : `Download network error: ${err.message}`, 0);
+        }
+        finally {
+            clearTimeout(timer);
+        }
+    }
+    /**
+     * Follows `links.next` until the collection is exhausted or `maxPages` is
+     * hit. The result says whether it stopped early (`hasMore` + `nextUrl`), so
+     * callers can't mistake a page-capped fetch for the complete collection.
+     *
+     * `enough` is for sorted collections where the caller can recognise the end
+     * of what it wanted before Apple runs out — reviews past the start of a date
+     * window, say. Without it the choice is a cap too low to be correct or one
+     * too high to be cheap.
+     */
+    async collect(path, query, maxPages = 10, enough) {
+        const items = [];
+        let next;
+        let pagesFetched = 0;
+        for (let page = 0; page < maxPages; page++) {
+            const res = next
+                ? await this.request('GET', next)
+                : await this.get(path, query);
+            pagesFetched++;
+            if (Array.isArray(res?.data))
+                items.push(...res.data);
+            else if (res?.data)
+                items.push(res.data);
+            next = res?.links?.next;
+            if (!next)
+                break;
+            // Satisfied, not exhausted: `hasMore` stays true because Apple does have
+            // more — the caller stopped wanting it.
+            if (enough?.(items))
+                break;
+        }
+        return { items, pagesFetched, hasMore: Boolean(next), nextUrl: next };
+    }
+}
+function tooBig(bytes, maxBytes) {
+    return new AscApiError(`Asset is at least ${bytes} bytes, over the ${maxBytes}-byte limit. Narrow the request.`, 0);
+}
+function applyQuery(url, query) {
+    for (const [key, value] of Object.entries(query)) {
+        if (value === undefined || value === null || value === '')
+            continue;
+        url.searchParams.set(key, Array.isArray(value) ? value.join(',') : String(value));
+    }
+}
+/** Exported for tests; not part of the client's public surface. */
+export function backoffMs(attempt, retryAfter) {
+    if (retryAfter) {
+        // Retry-After is either delay-seconds or an HTTP-date (RFC 9110 §10.2.3).
+        const seconds = Number(retryAfter);
+        if (Number.isFinite(seconds) && seconds > 0) {
+            return Math.min(seconds * 1000, 60_000);
+        }
+        const dateMs = Date.parse(retryAfter);
+        if (!Number.isNaN(dateMs)) {
+            const delta = dateMs - Date.now();
+            if (delta > 0)
+                return Math.min(delta, 60_000);
+        }
+    }
+    const base = Math.min(1000 * 2 ** attempt, 30_000);
+    return base + Math.random() * 250; // jitter, so parallel callers desynchronise
+}
+/**
+ * Actionable hints for the Apple errors people actually hit, appended to the
+ * error message so the fix travels with the failure (mirrors SUPPORT.md).
+ */
+export const STATUS_HINTS = {
+    401: 'Check that ASC_KEY_ID, ASC_ISSUER_ID and the .p8 key match and are not revoked.',
+    403: "The API key's role lacks permission for this operation: sales/finance reports need " +
+        'the Finance role, user management needs Admin, and app creation is restricted on ' +
+        'some accounts — create the app once in the App Store Connect web UI, then manage it here.',
+    409: 'App Store Connect rejected the change for the current resource state — a version in ' +
+        'review or already released is locked, and many fields are only editable in specific ' +
+        "states. Fetch the resource first to see its state; the issues[] entries name the " +
+        'field when Apple provides one.',
+    429: "Apple's rate limit was hit even though requests are paced locally — something else " +
+        'may be sharing this API key.',
+};
+/**
+ * The other 403. Apple returns the same status for "your key is scoped too
+ * narrowly" and "nobody signed the current agreement", and the generic hint
+ * sends the second case hunting through roles and fresh API keys — none of
+ * which can fix it, because the block is on the account and not on the key.
+ *
+ * Only the Account Holder can clear it, only on the developer website, and
+ * the "Agreements, Tax, and Banking" page in App Store Connect is a different
+ * agreement that looks like the right place and is not.
+ */
+export const AGREEMENT_HINT = 'This is not a permissions problem and a new API key will not fix it: the account has an ' +
+    'unsigned or expired agreement. Only the Account Holder can accept it, by signing in at ' +
+    'https://developer.apple.com/account and agreeing to the current Program License Agreement ' +
+    '(the "Agreements, Tax, and Banking" page in App Store Connect is a different agreement). ' +
+    'Every App Store Connect API call stays blocked until then.';
+async function toApiError(res) {
+    let errors = [];
+    let message = `App Store Connect API returned ${res.status}`;
+    try {
+        const body = (await res.json());
+        if (Array.isArray(body?.errors)) {
+            errors = body.errors;
+            const first = body.errors[0];
+            if (first?.detail || first?.title) {
+                message = `${message}: ${first.title ?? ''}${first.detail ? ` — ${first.detail}` : ''}`.trim();
+            }
+        }
+    }
+    catch {
+        // Non-JSON error body; the status line is all we have.
+    }
+    // The agreement 403 is answered before the generic one: same status, and
+    // the generic text would send the reader to the roles that cannot fix it.
+    const agreement = errors.some((e) => String(e.code ?? '').startsWith('FORBIDDEN.REQUIRED_AGREEMENTS'));
+    const hint = agreement ? AGREEMENT_HINT : STATUS_HINTS[res.status];
+    if (hint)
+        message += `. ${hint}`;
+    return new AscApiError(message, res.status, errors, res.headers.get('x-request-id') ?? undefined);
+}
+//# sourceMappingURL=http.js.map

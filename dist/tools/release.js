@@ -1,0 +1,167 @@
+import { AscApiError } from '../core/errors.js';
+import { resolveApp } from '../core/resolve-app.js';
+import { executePreflightTool } from './preflight.js';
+export const RELEASE_TOOLS = [
+    {
+        name: 'release__submit',
+        description: 'Send an App Store version to Apple for review in one call — it opens the submission, ' +
+            'puts the version in it, and hands it over. Checks first that the version is actually ' +
+            'submittable and refuses rather than submitting something that will bounce. Use this ' +
+            'instead of review_submissions__create, which by itself sends nothing.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                app: { type: 'string', description: 'App name, bundle ID (com.example.app) or numeric Apple ID.' },
+                version: {
+                    type: 'string',
+                    description: 'Version string (e.g. "3.2.0"). Defaults to the newest editable version.',
+                },
+                skip_preflight: {
+                    type: 'boolean',
+                    description: 'Submit even when the pre-flight finds blocking gaps. Off by default, and worth ' +
+                        'leaving off: every gap it reports is one Apple enforces.',
+                },
+            },
+            required: ['app'],
+        },
+        outputSchema: {
+            type: 'object',
+            properties: {
+                app: { type: 'string' },
+                version: { type: 'string' },
+                submissionId: { type: 'string' },
+                state: { type: 'string' },
+                steps: {
+                    type: 'array',
+                    description: 'What was done, in order, so a partial run says where it stopped.',
+                    items: { type: 'string' },
+                },
+                preflight: { type: 'object' },
+            },
+            required: ['app', 'version', 'steps'],
+        },
+    },
+];
+export const RELEASE_TOOL_NAMES = new Set(RELEASE_TOOLS.map((t) => t.name));
+export async function executeReleaseTool(name, args, ctx) {
+    if (name !== 'release__submit')
+        throw new Error(`Unknown release tool: ${name}`);
+    if (!args.app || typeof args.app !== 'string')
+        throw new AscApiError('"app" is required.', 0);
+    const http = ctx.http;
+    const app = await resolveApp(http, String(args.app));
+    // The pre-flight resolves the version itself, and its answer names the one
+    // it looked at — so this is also how the version gets chosen, rather than
+    // resolving it twice and risking two different answers.
+    const preflight = (await executePreflightTool('preflight__check_version', { app: String(args.app), ...(args.version ? { version: args.version } : {}) }, { http }));
+    if (!preflight.ready && args.skip_preflight !== true) {
+        throw new AscApiError(`${app.name} ${preflight.version} was not submitted — nothing was sent to Apple.\n` +
+            preflight.blocking.map((b) => `  - ${b.check}: ${b.problem}\n    fix with ${b.fixWith}`).join('\n') +
+            (preflight.blocking.length
+                ? '\nEvery one of these is enforced by Apple. Pass skip_preflight=true to submit anyway.'
+                : `\nVersion ${preflight.version} is ${preflight.state}, which is past the point of submitting.`), 0);
+    }
+    // Resolved after the pre-flight so a refusal costs one call rather than four.
+    const versions = await http.get(`/v1/apps/${encodeURIComponent(app.id)}/appStoreVersions`, {
+        // platform is load-bearing: the submission below is created for it, and a
+        // sparse fieldset that omits it makes every macOS, tvOS and visionOS
+        // submission silently claim to be iOS.
+        'fields[appStoreVersions]': 'versionString,appStoreState,platform',
+        limit: 20,
+    });
+    const version = (versions?.data ?? []).find((v) => String(v.attributes?.versionString ?? '') === preflight.version);
+    if (!version)
+        throw new AscApiError(`Version ${preflight.version} disappeared between calls.`, 0);
+    // Refused rather than defaulted. A submission carries a platform, and
+    // guessing IOS for a macOS or visionOS version creates the submission
+    // against the wrong one — which Apple accepts and nobody notices until the
+    // release does not appear where it was meant to.
+    const versionPlatform = String(version.attributes?.platform ?? '');
+    if (!versionPlatform) {
+        throw new AscApiError(`Apple returned no platform for version ${preflight.version}, and a review submission ` +
+            `has to name one. Read the version with app_store_versions__get to see what Apple ` +
+            `reports, then try again — submitting without it would guess, and a submission ` +
+            `created for the wrong platform is accepted and silently wrong.`, 0);
+    }
+    const steps = [];
+    if (ctx.dryRun) {
+        return {
+            dryRun: true,
+            app: `${app.name} (${app.id})`,
+            version: preflight.version,
+            preflight,
+            wouldDo: [
+                `reuse or open a review submission for app ${app.id}`,
+                `add version ${preflight.version} (${version.id}) to it as an item`,
+                'patch submitted=true, which is the step that reaches Apple',
+            ],
+        };
+    }
+    // An open submission is reused rather than duplicated: Apple allows one at a
+    // time per platform, and a second POST fails with a message about state that
+    // says nothing about the submission already sitting there.
+    //
+    // Filtered by platform as well as state. An app shipping on iOS and macOS can
+    // have one open on each, and reusing whichever came back first would put a
+    // macOS version into the iOS submission — the same wrong-platform mistake the
+    // fieldset above exists to prevent, arrived at from the other side.
+    const open = await http.get(`/v1/apps/${encodeURIComponent(app.id)}/reviewSubmissions`, {
+        'filter[state]': 'READY_FOR_REVIEW',
+        'filter[platform]': versionPlatform,
+        include: 'items',
+        limit: 5,
+    });
+    let submission = (open?.data ?? [])[0];
+    if (submission) {
+        steps.push(`Reused the open review submission ${submission.id}.`);
+    }
+    else {
+        const created = await http.request('POST', '/v1/reviewSubmissions', {
+            body: {
+                data: {
+                    type: 'reviewSubmissions',
+                    attributes: { platform: versionPlatform },
+                    relationships: { app: { data: { type: 'apps', id: app.id } } },
+                },
+            },
+        });
+        submission = created?.data;
+        if (!submission?.id)
+            throw new AscApiError('Apple accepted the submission POST and returned no id.', 0);
+        steps.push(`Opened review submission ${submission.id} — empty, and nothing sent yet.`);
+    }
+    const alreadyIn = (open?.included ?? []).some((i) => i.type === 'reviewSubmissionItems' &&
+        String(i.relationships?.appStoreVersion?.data?.id ?? '') === String(version.id));
+    if (alreadyIn) {
+        steps.push(`Version ${preflight.version} was already an item on it.`);
+    }
+    else {
+        await http.request('POST', '/v1/reviewSubmissionItems', {
+            body: {
+                data: {
+                    type: 'reviewSubmissionItems',
+                    relationships: {
+                        reviewSubmission: { data: { type: 'reviewSubmissions', id: submission.id } },
+                        appStoreVersion: { data: { type: 'appStoreVersions', id: version.id } },
+                    },
+                },
+            },
+        });
+        steps.push(`Added version ${preflight.version} to it. Still nothing sent.`);
+    }
+    // The step that actually reaches Apple, and the one an agent chaining raw
+    // calls forgets — which is how a release gets reported that never shipped.
+    const handed = await http.request('PATCH', `/v1/reviewSubmissions/${encodeURIComponent(submission.id)}`, {
+        body: { data: { type: 'reviewSubmissions', id: submission.id, attributes: { submitted: true } } },
+    });
+    steps.push('Handed it to Apple (submitted=true). This is the step that starts the queue.');
+    return {
+        app: `${app.name} (${app.id})`,
+        version: preflight.version,
+        submissionId: String(submission.id),
+        state: handed?.data?.attributes?.state ?? 'SUBMITTED',
+        steps,
+        preflight: { ready: preflight.ready, warnings: preflight.warnings ?? [] },
+    };
+}
+//# sourceMappingURL=release.js.map
